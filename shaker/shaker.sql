@@ -100,9 +100,8 @@ begin
 	v_sql_chunk := v_sql_chunk || ') group by num';
 	
 	execute immediate 'alter session set skip_unusable_indexes=true';
-	DBMS_RANDOM.seed(p_tablename || '_' || v_call_count);
 	v_call_count := v_call_count + 1;
-	v_task_name := proc_name || p_tablename || '_' || TRUNC(DBMS_RANDOM.value(1, 1000));
+	v_task_name := proc_name || p_tablename || '_' || v_call_count;
 --разбор полей в массив a_columns
 	select TRIM(REGEXP_SUBSTR(p_columns, '[^,]+', 1, level)) val bulk collect
 		into a_columns
@@ -131,7 +130,7 @@ WHEN OTHERS THEN
 	dbms_output.put_line(dbms_utility.format_error_backtrace);
 end exec_schema;
 ------------------------------------------------------------------------------------------
-procedure disable_foreign(p_tablename varchar2, p_primary varchar2, p_test in pls_integer default 0) is
+procedure disable_foreign(p_primary varchar2, p_test in pls_integer default 0) is
 	lv_foreign varchar_table;
 
 	procedure add_foreign(p_foreign varchar2) is
@@ -181,7 +180,7 @@ procedure disable_primary(p_tablename varchar2, p_indexname varchar2, p_test in 
 			end if;
 		end loop;
 		if entry = 0 then 
-			disable_foreign(p_tablename, p_primary, p_test);
+			disable_foreign(p_primary, p_test);
 			v_primary.extend(1);
 			v_primary(v_primary.last) := p_tablename || '.' || p_primary;
 			v_sql := 'alter table ' || p_tablename || ' disable constraint ' || p_primary;
@@ -249,8 +248,9 @@ begin
 	end loop;
 end enable_triggers;
 ------------------------------------------------------------------------------------------
-procedure enable_constraints(p_test in pls_integer default 0) is
+procedure enable_constraints(p_hmjobs in pls_integer, p_test in pls_integer default 0) is
 	v_sql varchar2(3000);
+	degreeTable integer;
 begin
 	for ind in 1..v_primary.count loop
 		v_sql := 'alter table '|| substr(v_primary(ind), 1, instr(v_primary(ind), '.') - 1 ) || 
@@ -262,8 +262,36 @@ begin
 		end if;
 	end loop;
 	for ind in 1..v_foreign.count loop
+		select degree into degreeTable from user_tables where table_name = 
+			substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 );
+		
 		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
-			' enable constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 );
+			' parallel ' || p_hmjobs;
+		if p_test = 0 then 
+			execute immediate v_sql;
+		else
+			dbms_output.put_line(v_sql || ';' ||CRLF);
+		end if;
+
+		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
+			' enable novalidate constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 );
+		if p_test = 0 then 
+			execute immediate v_sql;
+		else
+			dbms_output.put_line(v_sql || ';' ||CRLF);
+		end if;
+
+		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
+			' modify constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 ) ||
+			' validate';
+		if p_test = 0 then 
+			execute immediate v_sql;
+		else
+			dbms_output.put_line(v_sql || ';' ||CRLF);
+		end if;
+
+		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
+			' parallel ' || degreeTable;
 		if p_test = 0 then 
 			execute immediate v_sql;
 		else
@@ -355,17 +383,6 @@ begin
 		else
 			dbms_output.put_line(v_sql || ';' || CRLF);
 		end if;
-		v_sql := 'alter index ' || v_user || '.' || v_indexes(ind) || ' noparallel';
-		if p_test = 0 then
-			begin
-				execute immediate v_sql;
-			exception 
-			-- индексы обслуживающие constraint могут отсутствовать
-			when others then null;
-			end;
-		else
-			dbms_output.put_line(v_sql || ';' || CRLF);
-		end if;
 	end loop;
 end rebuild_indexes;
 ------------------------------------------------------------------------------------------
@@ -389,6 +406,8 @@ begin
     v_sql := v_sql || ' v_cnt pls_integer;' || CRLF;
     v_sql := v_sql || ' single_row_set exception;' || CRLF;
     v_sql := v_sql || 'begin' || CRLF;
+    v_sql := v_sql || '    execute immediate ''alter session set skip_unusable_indexes=true'';' || CRLF;
+
     v_sql := v_sql || '    select /*+ ROWID(t) */ rowid, ';
     for ind in 1..a_columns.COUNT loop
 		v_sql := v_sql || 't.' || a_columns(ind);
@@ -441,7 +460,7 @@ begin
 	--перестройка индексов
    	rebuild_indexes(p_hmjobs, p_test);
    	--подключение constraints
-   	enable_constraints(p_test);
+   	enable_constraints(p_hmjobs, p_test);
    	--подключение триггеров
    	enable_triggers(p_test);
 exception
