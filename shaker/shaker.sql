@@ -100,9 +100,8 @@ begin
 	v_sql_chunk := v_sql_chunk || ') group by num';
 	
 	execute immediate 'alter session set skip_unusable_indexes=true';
-	DBMS_RANDOM.seed(p_tablename || '_' || v_call_count);
 	v_call_count := v_call_count + 1;
-	v_task_name := proc_name || p_tablename || '_' || TRUNC(DBMS_RANDOM.value(1, 1000));
+	v_task_name := proc_name || p_tablename || '_' || v_call_count;
 --разбор полей в массив a_columns
 	select TRIM(REGEXP_SUBSTR(p_columns, '[^,]+', 1, level)) val bulk collect
 		into a_columns
@@ -249,11 +248,12 @@ begin
 	end loop;
 end enable_triggers;
 ------------------------------------------------------------------------------------------
-procedure enable_constraints(p_test in pls_integer default 0) is
+procedure enable_constraints(p_hmjobs in pls_integer, p_test in pls_integer default 0) is
 	v_sql varchar2(3000);
 begin
 	for ind in 1..v_primary.count loop
 		v_sql := 'alter table '|| substr(v_primary(ind), 1, instr(v_primary(ind), '.') - 1 ) || 
+			' parallel ' || p_hmjobs ||
 			' enable constraint '|| substr(v_primary(ind), instr(v_primary(ind), '.') + 1 );
 		if p_test = 0 then 
 			execute immediate v_sql;
@@ -263,6 +263,7 @@ begin
 	end loop;
 	for ind in 1..v_foreign.count loop
 		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
+			' parallel ' || p_hmjobs ||
 			' enable constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 );
 		if p_test = 0 then 
 			execute immediate v_sql;
@@ -355,17 +356,6 @@ begin
 		else
 			dbms_output.put_line(v_sql || ';' || CRLF);
 		end if;
-		v_sql := 'alter index ' || v_user || '.' || v_indexes(ind) || ' noparallel';
-		if p_test = 0 then
-			begin
-				execute immediate v_sql;
-			exception 
-			-- индексы обслуживающие constraint могут отсутствовать
-			when others then null;
-			end;
-		else
-			dbms_output.put_line(v_sql || ';' || CRLF);
-		end if;
 	end loop;
 end rebuild_indexes;
 ------------------------------------------------------------------------------------------
@@ -389,6 +379,8 @@ begin
     v_sql := v_sql || ' v_cnt pls_integer;' || CRLF;
     v_sql := v_sql || ' single_row_set exception;' || CRLF;
     v_sql := v_sql || 'begin' || CRLF;
+    v_sql := v_sql || '    execute immediate ''alter session set skip_unusable_indexes=true'';' || CRLF;
+
     v_sql := v_sql || '    select /*+ ROWID(t) */ rowid, ';
     for ind in 1..a_columns.COUNT loop
 		v_sql := v_sql || 't.' || a_columns(ind);
@@ -441,7 +433,7 @@ begin
 	--перестройка индексов
    	rebuild_indexes(p_hmjobs, p_test);
    	--подключение constraints
-   	enable_constraints(p_test);
+   	enable_constraints(p_hmjobs, p_test);
    	--подключение триггеров
    	enable_triggers(p_test);
 exception
