@@ -1,4 +1,4 @@
-﻿-- Пример запуска обфускатора данных
+﻿﻿-- Пример запуска обфускатора данных
 set head off
 set trimspool on
 set trimout on
