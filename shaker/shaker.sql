@@ -1,4 +1,4 @@
-﻿/* Пакет для обфускации (перемешивания) данных IBSO
+/* Пакет для обфускации (перемешивания) данных IBSO
 
 Необходимые права:
 выполнение dbms_parallel_execute (обычно имеет public доступ)
@@ -32,6 +32,10 @@ p_where - дополнительное условие огрпничивающе
 7. Подключаются constraint
 8. Подключаются триггеры.
 
+PS
+Для повторного запуска необходимо почистить задания с помощью
+dbms_parallel_execute.drop_task.
+
 */
 create or replace package shaker is
 	procedure before_schema(p_user in varchar2);
@@ -45,6 +49,7 @@ end shaker;
 create or replace package body shaker is
 	v_user varchar2(60);
 	type varchar_table  is table of varchar2(2000);
+	type clob_table is table of clob;
 	CRLF varchar2(10) := CHR(13) || CHR(10);
 	proc_name varchar2(30) := 'SHAKER_';
 	v_indexes varchar_table := varchar_table();
@@ -52,6 +57,7 @@ create or replace package body shaker is
 	v_primary varchar_table := varchar_table();
 	v_foreign varchar_table := varchar_table();
 	v_call_count pls_integer := 0;
+	v_pk_ddl clob_table := clob_table();
 ------------------------------------------------------------------------------------------
 procedure rebuild_indexes (p_hmjobs in pls_integer, p_test in pls_integer default 0);
                              
@@ -74,11 +80,11 @@ procedure  exec_schema (p_tablename in varchar2, p_columns in varchar2,
 	p_hmjobs in pls_integer, p_hmrows in pls_integer, p_test in pls_integer default 0, p_where in varchar2 default '')
 is
 	v_task_name varchar2(30);
-	v_sql varchar2(3000);
+	v_sql varchar2(32000);
 	a_columns varchar_table;
 	user_empty exception;
 	v_count integer;
-	v_sql_chunk varchar2(3000);
+	v_sql_chunk varchar2(32000);
 begin
 	if v_user is null then 
 		raise user_empty;
@@ -135,7 +141,7 @@ procedure disable_foreign(p_primary varchar2, p_test in pls_integer default 0) i
 
 	procedure add_foreign(p_foreign varchar2) is
 		entry pls_integer;
-		v_sql varchar2(3000);
+		v_sql varchar2(32000);
 	begin 
 		entry := 0;
 		for ind in 1..v_foreign.count loop
@@ -150,7 +156,12 @@ procedure disable_foreign(p_primary varchar2, p_test in pls_integer default 0) i
 			v_sql := 'alter table ' || substr(p_foreign, 1, instr(p_foreign, '.') - 1) || 
 				' disable constraint ' || substr(p_foreign, instr(p_foreign, '.') + 1);
 			if p_test = 0 then
-				execute immediate v_sql;
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when disable FK constraint: ' || v_sql || ';' || CRLF);
+				end;
 			else
 				dbms_output.put_line(v_sql || ';' || CRLF);
 			end if;
@@ -165,27 +176,62 @@ begin
 	end loop;
 end disable_foreign;
 ------------------------------------------------------------------------------------------
+function find_primary(p_primary varchar2) return pls_integer is
+begin
+	for ind in 1..v_primary.count loop
+		if v_primary(ind) = p_primary then 
+			return ind;
+		end if;
+	end loop;
+	return 0;
+end;
+------------------------------------------------------------------------------------------
+procedure save_primary_ddl(p_tablename varchar2, p_indexname varchar2) is
+	cnt pls_integer := 0;
+begin
+	if find_primary(p_tablename || '.' || p_indexname) = 0 then 
+		select count(1) into cnt from user_constraints 
+		where constraint_type = 'P' and table_name = p_tablename 
+		and constraint_name = p_indexname;
+		if cnt = 1 then 
+			v_pk_ddl.extend(1);
+			select dbms_metadata.get_ddl('INDEX',  p_indexname, v_user) into v_pk_ddl(v_pk_ddl.last) 
+				from dual;
+		end if;
+	end if;
+end;
+------------------------------------------------------------------------------------------
 procedure disable_primary(p_tablename varchar2, p_indexname varchar2, p_test in pls_integer default 0) is
 	lv_primary varchar_table;
 
 	procedure add_primary(p_primary varchar2) is
-		entry pls_integer;
-		v_sql varchar2(3000);
+		v_sql varchar2(32000);
 	begin 
-		entry := 0;
-		for ind in 1..v_primary.count loop
-			if v_primary(ind) = p_tablename || '.' || p_primary then 
-				entry := ind;
-				exit;
-			end if;
-		end loop;
-		if entry = 0 then 
+		if find_primary(p_tablename || '.' || p_primary) = 0 then 
 			disable_foreign(p_primary, p_test);
 			v_primary.extend(1);
 			v_primary(v_primary.last) := p_tablename || '.' || p_primary;
+
 			v_sql := 'alter table ' || p_tablename || ' disable constraint ' || p_primary;
 			if p_test = 0 then
-				execute immediate v_sql;
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when disable PK constraint: ' || v_sql || ';' || CRLF);
+				end;
+			else
+				dbms_output.put_line(v_sql || ';' || CRLF);
+			end if;
+
+			v_sql := 'drop index ' || p_primary;
+			if p_test = 0 then
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when drop PK index: ' || v_sql || ';' || CRLF);
+				end;
 			else
 				dbms_output.put_line(v_sql || ';' || CRLF);
 			end if;
@@ -206,7 +252,7 @@ procedure disable_triggers(p_tablename varchar2, p_test in pls_integer default 0
 
 	procedure add_trigger(p_trigger varchar2) is
 		entry pls_integer;
-		v_sql varchar2(3000);
+		v_sql varchar2(32000);
 	begin 
 		entry := 0;
 		for ind in 1..v_triggers.count loop
@@ -220,7 +266,12 @@ procedure disable_triggers(p_tablename varchar2, p_test in pls_integer default 0
 			v_triggers(v_triggers.last) := p_trigger;
 			v_sql := 'alter trigger ' || p_trigger || ' disable';
 			if p_test = 0 then
-				execute immediate v_sql;
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when disable trigger: ' || v_sql || ';' || CRLF);
+				end;
 			else
 				dbms_output.put_line(v_sql || ';' || CRLF);
 			end if;
@@ -236,12 +287,17 @@ begin
 end disable_triggers;
 ------------------------------------------------------------------------------------------
 procedure enable_triggers(p_test in pls_integer default 0) is
-	v_sql varchar2(3000);
+	v_sql varchar2(32000);
 begin
 	for ind in 1..v_triggers.count loop
 		v_sql := 'alter trigger '|| v_triggers(ind) || ' enable';
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when enable trigger: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -249,14 +305,19 @@ begin
 end enable_triggers;
 ------------------------------------------------------------------------------------------
 procedure enable_constraints(p_hmjobs in pls_integer, p_test in pls_integer default 0) is
-	v_sql varchar2(3000);
+	v_sql varchar2(32000);
 	degreeTable integer;
 begin
 	for ind in 1..v_primary.count loop
 		v_sql := 'alter table '|| substr(v_primary(ind), 1, instr(v_primary(ind), '.') - 1 ) || 
 			' enable constraint '|| substr(v_primary(ind), instr(v_primary(ind), '.') + 1 );
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when enable constraint: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -268,7 +329,12 @@ begin
 		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
 			' parallel ' || p_hmjobs;
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when set degree value: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -276,7 +342,12 @@ begin
 		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
 			' enable novalidate constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 );
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when enable FK constraint: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -285,7 +356,12 @@ begin
 			' modify constraint '|| substr(v_foreign(ind), instr(v_foreign(ind), '.') + 1 ) ||
 			' validate';
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when validate FK constraint: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -293,7 +369,12 @@ begin
 		v_sql := 'alter table '|| substr(v_foreign(ind), 1, instr(v_foreign(ind), '.') - 1 ) || 
 			' parallel ' || degreeTable;
 		if p_test = 0 then 
-			execute immediate v_sql;
+			begin
+				execute immediate v_sql;
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when restore degree value: ' || v_sql || ';' || CRLF);
+			end;
 		else
 			dbms_output.put_line(v_sql || ';' ||CRLF);
 		end if;
@@ -302,13 +383,14 @@ end enable_constraints;
 ------------------------------------------------------------------------------------------
 procedure disable_indexes(v_task_name varchar2, a_columns varchar_table,
                             p_tablename in varchar2, p_test in pls_integer default 0) is
-	v_sql varchar2(3000);
+	v_sql varchar2(32000);
 	lv_indexes varchar_table;
 	
 	procedure add_index(p_index varchar2) is
 		entry pls_integer;
-		v_sql varchar2(3000);
+		v_sql varchar2(32000);
 	begin 
+--		dbms_output.put_line(p_index || CRLF);	
 		entry := 0;
 		for ind in 1..v_indexes.count loop
 			if v_indexes(ind) = p_index then 
@@ -317,11 +399,17 @@ procedure disable_indexes(v_task_name varchar2, a_columns varchar_table,
 			end if;
 		end loop;
 		if entry = 0 then 
+			save_primary_ddl(p_tablename, p_index);
 			v_indexes.extend(1);
 			v_indexes(v_indexes.last) := p_index;
 			v_sql := 'alter index ' || v_user || '.' || p_index || ' unusable';
 			if p_test = 0 then
-				execute immediate v_sql;
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when set index unusable: ' || v_sql || ';' || CRLF);
+				end;
 			else
 				dbms_output.put_line(v_sql || ';' || CRLF);
 			end if;
@@ -367,28 +455,53 @@ begin
     end loop;
 end disable_indexes;
 ------------------------------------------------------------------------------------------
-procedure rebuild_indexes (p_hmjobs in pls_integer, p_test in pls_integer default 0) is
-	v_sql varchar2(3000);
+procedure rebuild_pk_indexes(p_test in pls_integer default 0) is
 begin
-    for ind in 1..v_indexes.COUNT loop
---     	v_sql := 'alter index ' || v_user || '.' || v_indexes(ind) || ' rebuild online parallel ' || p_hmjobs;
-		v_sql := 'alter index ' || v_user || '.' || v_indexes(ind) || ' rebuild parallel ' || p_hmjobs;
+	for ind in 1..v_pk_ddl.count loop
 		if p_test = 0 then
 			begin
-				execute immediate v_sql;
-			exception 
-			-- индексы обслуживающие constraint могут отсутствовать
-			when others then null;
+				execute immediate v_pk_ddl(ind);
+			exception when others then 
+				dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+				dbms_output.put_line('ERROR when recreate PK index: ' || v_pk_ddl(ind) || ';' || CRLF);
 			end;
 		else
-			dbms_output.put_line(v_sql || ';' || CRLF);
+			dbms_output.put_line(v_pk_ddl(ind) || ';' || CRLF);
+		end if;
+	end loop;
+end rebuild_pk_indexes;
+------------------------------------------------------------------------------------------
+procedure rebuild_indexes (p_hmjobs in pls_integer, p_test in pls_integer default 0) is
+	v_sql varchar2(32000);
+	entry pls_integer;
+begin
+    for ind in 1..v_indexes.COUNT loop
+		entry := 0;
+		for ind_p in 1..v_primary.count loop
+			if v_primary(ind_p) = v_indexes(ind) then 
+				entry := ind;
+				exit;
+			end if;
+		end loop;
+		if entry = 0 then 
+			v_sql := 'alter index ' || v_user || '.' || v_indexes(ind) || ' rebuild parallel ' || p_hmjobs;
+			if p_test = 0 then
+				begin
+					execute immediate v_sql;
+				exception when others then 
+					dbms_output.put_line(SQLCODE || ' ' || SQLERRM);
+					dbms_output.put_line('ERROR when rebuild FK index: ' || v_sql || ';' || CRLF);
+				end;
+			else
+				dbms_output.put_line(v_sql || ';' || CRLF);
+			end if;
 		end if;
 	end loop;
 end rebuild_indexes;
 ------------------------------------------------------------------------------------------
 function create_sql_text (p_tablename in varchar2, a_columns varchar_table
 	, p_where in varchar2 default '') return varchar2 is
-	v_sql varchar2(3000);
+	v_sql varchar2(32000);
 begin
     v_sql:= 'declare' || CRLF || ' TYPE v_record_type is RECORD (' || CRLF || '  ROWID_col ROWID,' || CRLF;
     for ind in 1..a_columns.COUNT loop
@@ -457,9 +570,10 @@ end create_sql_text;
 ------------------------------------------------------------------------------------------
 procedure after_schema(p_hmjobs in pls_integer, p_test in pls_integer default 0) is
 begin
-	--перестройка индексов
-   	rebuild_indexes(p_hmjobs, p_test);
    	--подключение constraints
+	--перестройка индексов
+	rebuild_pk_indexes(p_test);
+   	rebuild_indexes(p_hmjobs, p_test);
    	enable_constraints(p_hmjobs, p_test);
    	--подключение триггеров
    	enable_triggers(p_test);
